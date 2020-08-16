@@ -7,8 +7,6 @@ var categoryByID map[int]Category
 var childCategories map[int][]int
 
 func loadCategories() {
-	categoryByID = make(map[int]Category)
-
 	err := dbx.Select(&allCategories, "SELECT * FROM `categories`")
 	if err != nil {
 		log.Fatal(err)

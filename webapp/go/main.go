@@ -327,6 +327,7 @@ func main() {
 	defer dbx.Close()
 
 	loadCategories()
+	loadUsers()
 
 	mux := goji.NewMux()
 
@@ -392,7 +393,7 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 		return user, http.StatusNotFound, "no session"
 	}
 
-	err := dbx.Get(&user, "SELECT * FROM `users` WHERE `id` = ?", userID)
+	user, err := getUserByID(userID.(int64))
 	if err == sql.ErrNoRows {
 		return user, http.StatusNotFound, "user not found"
 	}
@@ -402,18 +403,6 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 	}
 
 	return user, http.StatusOK, ""
-}
-
-func getUserSimpleByID(q sqlx.Queryer, userID int64) (userSimple UserSimple, err error) {
-	user := User{}
-	err = sqlx.Get(q, &user, "SELECT * FROM `users` WHERE `id` = ?", userID)
-	if err != nil {
-		return userSimple, err
-	}
-	userSimple.ID = user.ID
-	userSimple.AccountName = user.AccountName
-	userSimple.NumSellItems = user.NumSellItems
-	return userSimple, err
 }
 
 func getCategoryByID(q sqlx.Queryer, categoryID int) (category Category, err error) {
@@ -1440,33 +1429,45 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scr, err := APIShipmentCreate(getShipmentServiceURL(), &APIShipmentCreateReq{
-		ToAddress:   buyer.Address,
-		ToName:      buyer.AccountName,
-		FromAddress: seller.Address,
-		FromName:    seller.AccountName,
-	})
-	if err != nil {
-		log.Print(err)
-		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
-		tx.Rollback()
+	var scr *APIShipmentCreateRes
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	go func() {
+		scr, err = APIShipmentCreate(getShipmentServiceURL(), &APIShipmentCreateReq{
+			ToAddress:   buyer.Address,
+			ToName:      buyer.AccountName,
+			FromAddress: seller.Address,
+			FromName:    seller.AccountName,
+		})
+		if err != nil {
+			log.Print(err)
+			outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
+			tx.Rollback()
 
-		return
-	}
+			return
+		}
+		wg.Done()
+	}()
 
-	pstr, err := APIPaymentToken(getPaymentServiceURL(), &APIPaymentServiceTokenReq{
-		ShopID: PaymentServiceIsucariShopID,
-		Token:  rb.Token,
-		APIKey: PaymentServiceIsucariAPIKey,
-		Price:  targetItem.Price,
-	})
-	if err != nil {
-		log.Print(err)
+	var pstr *APIPaymentServiceTokenRes
+	go func() {
+		pstr, err = APIPaymentToken(getPaymentServiceURL(), &APIPaymentServiceTokenReq{
+			ShopID: PaymentServiceIsucariShopID,
+			Token:  rb.Token,
+			APIKey: PaymentServiceIsucariAPIKey,
+			Price:  targetItem.Price,
+		})
+		if err != nil {
+			log.Print(err)
 
-		outputErrorMsg(w, http.StatusInternalServerError, "payment service is failed")
-		tx.Rollback()
-		return
-	}
+			outputErrorMsg(w, http.StatusInternalServerError, "payment service is failed")
+			tx.Rollback()
+			return
+		}
+		wg.Done()
+	}()
+
+	wg.Wait()
 
 	if pstr.Status == "invalid" {
 		outputErrorMsg(w, http.StatusBadRequest, "カード情報に誤りがあります")
@@ -2066,12 +2067,7 @@ func postSell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now()
-	_, err = tx.Exec("UPDATE `users` SET `num_sell_items`=?, `last_bump`=? WHERE `id`=?",
-		seller.NumSellItems+1,
-		now,
-		seller.ID,
-	)
+	err = updateUser(tx, seller, time.Now())
 	if err != nil {
 		log.Print(err)
 
@@ -2169,10 +2165,7 @@ func postBump(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec("UPDATE `users` SET `last_bump`=? WHERE id=?",
-		now,
-		seller.ID,
-	)
+	err = updateUser(tx, seller, now)
 	if err != nil {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
@@ -2241,8 +2234,7 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u := User{}
-	err = dbx.Get(&u, "SELECT * FROM `users` WHERE `account_name` = ?", accountName)
+	u, err := getUserByAccountName(accountName)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusUnauthorized, "アカウント名かパスワードが間違えています")
 		return
@@ -2307,19 +2299,11 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := dbx.Exec("INSERT INTO `users` (`account_name`, `hashed_password`, `address`) VALUES (?, ?, ?)",
+	userID, err := insertUser(
 		accountName,
 		hashedPassword,
 		address,
 	)
-	if err != nil {
-		log.Print(err)
-
-		outputErrorMsg(w, http.StatusInternalServerError, "db error")
-		return
-	}
-
-	userID, err := result.LastInsertId()
 
 	if err != nil {
 		log.Print(err)
