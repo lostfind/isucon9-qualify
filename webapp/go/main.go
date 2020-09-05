@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	crand "crypto/rand"
 	"database/sql"
 	"encoding/json"
@@ -16,9 +17,9 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
+	_ "github.com/newrelic/go-agent/v3/integrations/nrmysql"
 	"github.com/newrelic/go-agent/v3/newrelic"
 	goji "goji.io"
 	"goji.io/pat"
@@ -338,15 +339,15 @@ func main() {
 		dbname,
 	)
 
-	dbx, err = sqlx.Open("mysql", dsn)
+	dbx, err = sqlx.Open("nrmysql", dsn)
 	if err != nil {
 		log.Fatalf("failed to connect to DB: %s.", err.Error())
 	}
 	defer dbx.Close()
 
 	app, err = newrelic.NewApplication(
-		newrelic.ConfigAppName("isucari"),
-		newrelic.ConfigLicense("newrelic_licence"),
+		newrelic.ConfigAppName(NewRelicConf.AppName()),
+		newrelic.ConfigLicense(NewRelicConf.License()),
 		newrelic.ConfigDistributedTracerEnabled(true),
 	)
 
@@ -882,11 +883,15 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tx := dbx.MustBegin()
+	txn := app.StartTransaction("getTransactions")
+	ctx := newrelic.NewContext(context.Background(), txn)
+
 	var rows *sqlx.Rows
 
 	if itemID > 0 && createdAt > 0 {
+
 		// paging
-		rows, err = tx.Queryx(
+		rows, err = tx.QueryxContext(ctx,
 			`SELECT
 	transaction_evidences.id as evidence_id,
 	transaction_evidences.status as evidence_status,
@@ -934,7 +939,7 @@ LIMIT ?`,
 		}
 	} else {
 		// 1st page
-		rows, err = tx.Queryx(
+		rows, err = tx.QueryxContext(ctx,
 			`SELECT
 	transaction_evidences.id as evidence_id,
 	transaction_evidences.status as evidence_status,
@@ -974,6 +979,7 @@ LIMIT ?`,
 			log.Print(err)
 			outputErrorMsg(w, http.StatusInternalServerError, "db error")
 			tx.Rollback()
+			txn.End()
 			return
 		}
 	}
@@ -1072,6 +1078,7 @@ LIMIT ?`,
 		itemDetails = append(itemDetails, itemDetail)
 	}
 	tx.Commit()
+	txn.End()
 
 	hasNext := false
 	if len(itemDetails) > TransactionsPerPage {
