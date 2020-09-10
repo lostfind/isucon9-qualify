@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	crand "crypto/rand"
 	"database/sql"
 	"encoding/json"
@@ -17,10 +16,11 @@ import (
 	"sync"
 	"time"
 
+	"cloud.google.com/go/profiler"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
-	_ "github.com/newrelic/go-agent/v3/integrations/nrmysql"
-	"github.com/newrelic/go-agent/v3/newrelic"
+
 	goji "goji.io"
 	"goji.io/pat"
 	"golang.org/x/crypto/bcrypt"
@@ -281,30 +281,20 @@ func init() {
 	))
 }
 
-var (
-	app    *newrelic.Application
-	client = &http.Client{
-		Transport: newrelic.NewRoundTripper(nil),
-		Timeout:   time.Duration(10) * time.Second,
-	}
-)
-
-// Middleware to create/end NewRelic transaction
-func nrt(inner http.Handler) http.Handler {
-	mw := func(w http.ResponseWriter, r *http.Request) {
-		txn := app.StartTransaction(r.URL.Path)
-		defer txn.End()
-
-		r = newrelic.RequestWithTransactionContext(r, txn)
-
-		txn.SetWebRequestHTTP(r)
-		w = txn.SetWebResponse(w)
-		inner.ServeHTTP(w, r)
-	}
-	return http.HandlerFunc(mw)
-}
-
 func main() {
+	cfg := profiler.Config{
+		Service:        "isucon9",
+		ServiceVersion: "1.0.0",
+		ProjectID:      os.Getenv("GOOGLE_CLOUD_PROJECT"),
+		DebugLogging:   true,
+		MutexProfiling: true,
+	}
+
+	// Profiler initialization, best done as early as possible.
+	if err := profiler.Start(cfg); err != nil {
+		log.Fatalf("failed to start the profiler: %v", err)
+	}
+
 	host := os.Getenv("MYSQL_HOST")
 	if host == "" {
 		host = "127.0.0.1"
@@ -339,23 +329,16 @@ func main() {
 		dbname,
 	)
 
-	dbx, err = sqlx.Open("nrmysql", dsn)
+	dbx, err = sqlx.Open("mysql", dsn)
 	if err != nil {
 		log.Fatalf("failed to connect to DB: %s.", err.Error())
 	}
 	defer dbx.Close()
 
-	app, err = newrelic.NewApplication(
-		newrelic.ConfigAppName(NewRelicConf.AppName()),
-		newrelic.ConfigLicense(NewRelicConf.License()),
-		newrelic.ConfigDistributedTracerEnabled(true),
-	)
-
 	loadCategories()
 	loadUsers()
 
 	mux := goji.NewMux()
-	mux.Use(nrt)
 
 	// API
 	mux.HandleFunc(pat.Post("/initialize"), postInitialize)
@@ -883,16 +866,12 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tx := dbx.MustBegin()
-	txn := app.StartTransaction("getTransactions")
-	ctx := newrelic.NewContext(context.Background(), txn)
-
 	var rows *sqlx.Rows
 
 	if itemID > 0 && createdAt > 0 {
 
 		// paging
-		rows, err = tx.QueryxContext(ctx,
-			`SELECT
+		rows, err = tx.Queryx(`SELECT
 	transaction_evidences.id as evidence_id,
 	transaction_evidences.status as evidence_status,
 	shippings.reserve_id,
@@ -939,11 +918,10 @@ LIMIT ?`,
 		}
 	} else {
 		// 1st page
-		rows, err = tx.QueryxContext(ctx,
-			`SELECT
+		rows, err = tx.Queryx(`SELECT
 	transaction_evidences.id as evidence_id,
 	transaction_evidences.status as evidence_status,
-	shippings.reserve_id,
+	shippings.status,
 	users.id AS user_id,
 	users.account_name,
 	users.num_sell_items,
@@ -979,13 +957,11 @@ LIMIT ?`,
 			log.Print(err)
 			outputErrorMsg(w, http.StatusInternalServerError, "db error")
 			tx.Rollback()
-			txn.End()
 			return
 		}
 	}
 
 	itemDetails := []ItemDetail{}
-	wg := sync.WaitGroup{}
 	for rows.Next() {
 		item := Item{}
 		seller := UserSimple{}
@@ -994,12 +970,12 @@ LIMIT ?`,
 		buyerNumSellItems := sql.NullInt64{}
 		evidenceID := sql.NullInt64{}
 		evicenceStatus := sql.NullString{}
-		reserveID := sql.NullString{}
+		shippingStatus := sql.NullString{}
 
 		err := rows.Scan(
 			&evidenceID,
 			&evicenceStatus,
-			&reserveID,
+			&shippingStatus,
 			&seller.ID,
 			&seller.AccountName,
 			&seller.NumSellItems,
@@ -1057,28 +1033,12 @@ LIMIT ?`,
 		if evidenceID.Int64 > 0 {
 			itemDetail.TransactionEvidenceID = evidenceID.Int64
 			itemDetail.TransactionEvidenceStatus = evicenceStatus.String
-			wg.Add(1)
-			go func() {
-				ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
-					ReserveID: reserveID.String,
-				})
-				if err != nil {
-					log.Print(err)
-					outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
-					tx.Rollback()
-					return
-				}
-
-				itemDetail.ShippingStatus = ssr.Status
-				wg.Done()
-			}()
+			itemDetail.ShippingStatus = shippingStatus.String
 		}
-		wg.Wait()
 
 		itemDetails = append(itemDetails, itemDetail)
 	}
 	tx.Commit()
-	txn.End()
 
 	hasNext := false
 	if len(itemDetails) > TransactionsPerPage {
